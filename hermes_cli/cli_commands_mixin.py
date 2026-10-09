@@ -700,7 +700,112 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
                 pass
         print(text)
 
-    # ---- /snapshot ------------------------------------------------------------------------
+    # ---- /mymodels ------------------------------------------------------------------------
+    def _handle_mymodels_command(self, command: str):
+        """Handle ``/mymodels [all]`` — every provider with credentials and the models it serves.
+
+        Unlike the ``/model`` picker (which is scoped to the CURRENT provider), this lists all
+        authenticated/configured providers side by side so a mid-session switch target can be
+        found without flipping providers first. Catalog lookups are disk/static only
+        (``allow_network=False``); the current provider gets a live local-endpoint probe so
+        LM Studio / Ollama models show up even though models.dev does not track them."""
+        from hermes_cli.models import list_available_providers
+        from agent.models_dev import list_provider_models
+
+        show_all = "all" in (command.lower().split()[1:] if len(command.split()) > 1 else [])
+        current_provider = (getattr(self, "provider", "") or "").strip().lower()
+        current_model = (getattr(self, "model", "") or "").strip()
+
+        # alias names per ``provider/model`` target (short-form and dict-form aliases).
+        from hermes_cli.config import load_config
+        root_cfg = load_config() if isinstance(load_config(), dict) else {}
+        model_cfg = root_cfg.get("model") if isinstance(root_cfg.get("model"), dict) else {}
+        agent_cfg = root_cfg.get("agent") if isinstance(root_cfg.get("agent"), dict) else {}
+        effort_overrides = agent_cfg.get("reasoning_overrides")
+        effort_overrides = effort_overrides if isinstance(effort_overrides, dict) else {}
+        alias_names: dict[str, list[str]] = {}
+        for alias, target in (model_cfg.get("aliases") or {}).items():
+            if isinstance(target, str) and "/" in target:
+                alias_names.setdefault(target.lower(), []).append(str(alias))
+            elif isinstance(target, dict) and target.get("model"):
+                key = f"{target.get('provider', '')}/{target['model']}"
+                alias_names.setdefault(key.lower(), []).append(str(alias))
+
+        # Current + configured-default providers always show even without a credential flag
+        # (LM Studio and other keyless local runtimes never authenticate but ARE usable routes).
+        default_provider = str(model_cfg.get("provider") or "").strip().lower() if isinstance(model_cfg, dict) else ""
+        providers = list_available_providers()
+        configured = [p for p in providers if p.get("authenticated")]
+        merged: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for prov in (
+            *[{"id": pid, "label": pid} for pid in (current_provider, default_provider) if pid],
+            *configured,
+        ):
+            pid_key = str(prov["id"]).strip().lower()
+            if not pid_key or pid_key in seen:
+                continue
+            seen.add(pid_key)
+            merged.append(prov)
+        merged.sort(key=lambda p: (str(p["id"]).lower() != current_provider, str(p["id"])))
+        configured = merged
+
+        def _local_models(pid: str, base_url: str) -> list[str]:
+            from hermes_cli.models_local import fetch_lmstudio_models
+            if pid == "lmstudio":
+                try:
+                    return fetch_lmstudio_models(base_url=base_url) or []
+                except Exception:
+                    return []
+            return []
+
+        base_url = (model_cfg.get("base_url") or "").strip() if isinstance(model_cfg, dict) else ""
+        shown_any = False
+        for prov in configured:
+            pid, label = str(prov["id"]), str(prov.get("label") or prov["id"])
+            models = list_provider_models(pid, allow_network=False)
+            if not models:
+                models = _local_models(pid, base_url) if pid == current_provider else []
+            is_current = pid.lower() == current_provider
+            if is_current:
+                # Surface the in-use model and alias'd models before the alphabetical tail: with
+                # hundreds of catalog entries the useful rows must not fall past the display cap.
+                def _rank(mid: str) -> tuple[int, str]:
+                    if mid == current_model:
+                        return (0, mid)
+                    if alias_names.get(f"{pid}/{mid}".lower()) or alias_names.get(mid.lower()):
+                        return (1, mid)
+                    return (2, mid)
+                models = sorted(models, key=_rank)
+            header = f"  {label} ({pid})"
+            if is_current:
+                header += "  <-- current"
+            print(header)
+            if not models:
+                print("    (no models in cached catalog; /model opens a live picker)")
+                continue
+            shown_any = True
+            cap = None if show_all else 25
+            for mid in models[:cap] if cap else models:
+                key = f"{pid}/{mid}".lower()
+                marks = []
+                if is_current and mid == current_model:
+                    marks.append("current")
+                aliases = alias_names.get(key) or alias_names.get(mid.lower()) or []
+                if aliases:
+                    marks.append("alias: " + ", ".join(aliases))
+                effort = effort_overrides.get(mid) or effort_overrides.get(f"{pid}/{mid}")
+                if effort:
+                    marks.append(f"effort: {effort}")
+                suffix = f"   [{'; '.join(marks)}]" if marks else ""
+                print(f"    {mid}{suffix}")
+            if cap and len(models) > cap:
+                print(f"    … and {len(models) - cap} more (/mymodels all for the full list)")
+        if not shown_any:
+            print("  No providers with credentials found. Add one with `hermes auth add <provider>`"
+                  " or `hermes model`.")
+
+
     def _handle_snapshot_command(self, command: str):
         """Handle /snapshot [list|create [label]|restore <id>|prune [N]] — state snapshots."""
         parts = command.split()
